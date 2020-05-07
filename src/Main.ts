@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import { Bridge, PrometheusMetrics, StateLookup,
+import { Bridge, PrometheusMetrics, Gauge, StateLookup,
     Logging, Intent, MatrixUser as BridgeMatrixUser,
     Request } from "matrix-appservice-bridge";
 import * as path from "path";
@@ -27,11 +27,11 @@ import { SlackGhost } from "./SlackGhost";
 import { MatrixUser } from "./MatrixUser";
 import { SlackHookHandler } from "./SlackHookHandler";
 import { AdminCommands } from "./AdminCommands";
-import * as Provisioning from "./Provisioning";
+import { Provisioner } from "./Provisioning";
 import { INTERNAL_ID_LEN } from "./BaseSlackHandler";
 import { SlackRTMHandler } from "./SlackRTMHandler";
 import { ConversationsInfoResponse, ConversationsOpenResponse, AuthTestResponse } from "./SlackResponses";
-import { Datastore, TeamEntry, RoomEntry } from "./datastore/Models";
+import { Datastore, TeamEntry, RoomEntry, RoomType } from "./datastore/Models";
 import { NedbDatastore } from "./datastore/NedbDatastore";
 import { PgDatastore } from "./datastore/postgres/PgDatastore";
 import { SlackClientFactory } from "./SlackClientFactory";
@@ -43,11 +43,16 @@ import { UserAdminRoom } from "./rooms/UserAdminRoom";
 import { TeamSyncer } from "./TeamSyncer";
 import { AppService, AppServiceRegistration } from "matrix-appservice";
 import { SlackGhostStore } from "./SlackGhostStore";
+import { stringify } from "querystring";
 
 const log = Logging.get("Main");
 
 const RECENT_EVENTID_SIZE = 20;
 const STARTUP_TEAM_INIT_CONCURRENCY = 10;
+export const METRIC_ACTIVE_USERS = "active_users";
+export const METRIC_ACTIVE_ROOMS = "active_rooms";
+export const METRIC_PUPPETS = "remote_puppets";
+export const METRIC_RECEIVED_MESSAGE = "received_messages";
 export const METRIC_SENT_MESSAGES = "sent_messages";
 
 export interface ISlackTeam {
@@ -102,12 +107,17 @@ export class Main {
     private slackHookHandler?: SlackHookHandler;
     private slackRtm?: SlackRTMHandler;
 
-    // tslint:disable-next-line: no-any
     private metrics: PrometheusMetrics;
+    private metricsCollectorInterval?: NodeJS.Timeout;
+    private metricActiveRooms: Gauge;
+    private metricActiveUsers: Gauge;
+    private metricPuppets: Gauge;
 
     private adminCommands = new AdminCommands(this);
     private clientfactory!: SlackClientFactory;
     public readonly teamSyncer?: TeamSyncer;
+
+    private provisioner: Provisioner;
 
     constructor(public readonly config: IConfig, registration: AppServiceRegistration) {
         if (config.oauth2) {
@@ -166,6 +176,8 @@ export class Main {
             ...bridgeStores,
             disableContext: true,
         });
+
+        this.provisioner = new Provisioner(this, this.bridge);
 
         if (!usingNeDB) {
             // If these are undefined in the constructor, default names
@@ -252,7 +264,7 @@ export class Main {
         this.metrics.addCounter({
             help: "count of received messages",
             labels: ["side"],
-            name: "received_messages",
+            name: METRIC_RECEIVED_MESSAGE,
         });
         this.metrics.addCounter({
             help: "count of sent messages",
@@ -274,6 +286,21 @@ export class Main {
             labels: ["outcome"],
             name: "remote_request_seconds",
         });
+        this.metricActiveUsers = this.metrics.addGauge({
+            help: "Count of active users",
+            labels: ["remote", "team_id"],
+            name: METRIC_ACTIVE_USERS,
+        });
+        this.metricActiveRooms = this.metrics.addGauge({
+            help: "Count of active bridged rooms (types are 'channel' and 'user')",
+            labels: ["team_id", "type"],
+            name: METRIC_ACTIVE_ROOMS,
+        });
+        this.metricPuppets = this.metrics.addGauge({
+            help: "Amount of puppeted users on the remote side of the bridge",
+            labels: ["team_id"],
+            name: METRIC_PUPPETS,
+        });
     }
 
     public incCounter(name: string, labels: MetricsLabels = {}) {
@@ -284,6 +311,29 @@ export class Main {
     public incRemoteCallCounter(type: string) {
         if (!this.metrics) { return; }
         this.metrics.incCounter("remote_api_calls", {method: type});
+    }
+
+    /**
+     * Gathers the active rooms and users from the database and updates the metrics.
+     * This function should be called on a regular interval or after an important
+     * change to the metrics has happened.
+     */
+    public async updateActivityMetrics() {
+        const roomsByTeamAndType = await this.datastore.getActiveRoomsPerTeam();
+        const usersByTeamAndRemote = await this.datastore.getActiveUsersPerTeam();
+
+        this.metricActiveRooms.reset();
+        for (const [teamId, teamData] of roomsByTeamAndType.entries()) {
+            for (const [roomType, numberOfActiveRooms] of teamData.entries()) {
+                this.metricActiveRooms.set({ team_id: teamId, type: roomType }, numberOfActiveRooms);
+            }
+        }
+
+        this.metricActiveUsers.reset();
+        for (const [teamId, teamData] of usersByTeamAndRemote.entries()) {
+            this.metricActiveUsers.set({ team_id: teamId, remote: true }, teamData.get(true) || 0);
+            this.metricActiveUsers.set({ team_id: teamId, remote: false }, teamData.get(false) || 0);
+        }
     }
 
     public startTimer(name: string, labels: MetricsLabels = {}) {
@@ -423,7 +473,7 @@ export class Main {
         this.mostRecentEventIdIdx = (this.mostRecentEventIdIdx + 1) % RECENT_EVENTID_SIZE;
         recents[this.mostRecentEventIdIdx] = ev.event_id;
 
-        this.incCounter("received_messages", {side: "matrix"});
+        this.incCounter(METRIC_RECEIVED_MESSAGE, {side: "matrix"});
         const endTimer = this.startTimer("matrix_request_seconds");
 
         if (UserAdminRoom.IsAdminRoomInvite(ev, this.botUserId)) {
@@ -740,6 +790,8 @@ export class Main {
 
         this.clientfactory = new SlackClientFactory(this.datastore, this.config, (method: string) => {
             this.incRemoteCallCounter(method);
+        }, (teamId: string, delta: number) => {
+            this.metricPuppets.inc({ team_id: teamId }, delta);
         });
         let puppetsWaiting: Promise<unknown> = Promise.resolve();
         if (this.slackRtm) {
@@ -764,9 +816,15 @@ export class Main {
             handler: this.onHealth.bind(this.bridge),
             method: "GET",
             path: "/health",
+            checkToken: false,
         });
 
-        Provisioning.addAppServicePath(this.bridge, this);
+        const provisioningEnabled = this.config.provisioning?.enable;
+
+        // Previously, this was always true.
+        if (provisioningEnabled === undefined ? true : provisioningEnabled) {
+            this.provisioner.addAppServicePath();
+        }
 
         // TODO(paul): see above; we had to defer this until now
         this.stateStorage = new StateLookup({
@@ -826,6 +884,17 @@ export class Main {
 
         if (this.metrics) {
             this.metrics.addAppServicePath(this.bridge);
+
+            // Regularly update the metrics for active rooms and users
+            const ONE_HOUR = 60 * 60 * 1000;
+            this.metricsCollectorInterval = setInterval(() => {
+                log.info("Recalculating activity metrics...");
+                this.updateActivityMetrics().catch((err) => {
+                    log.error(`Error updating activity metrics`, err);
+                });
+            }, ONE_HOUR);
+            await this.updateActivityMetrics();
+
             // Send process stats again just to make the counters update sooner after
             // startup
             this.metrics.refresh();
@@ -1054,6 +1123,9 @@ export class Main {
 
     public async killBridge() {
         log.info("Killing bridge");
+        if (this.metricsCollectorInterval) {
+            clearInterval(this.metricsCollectorInterval);
+        }
         if (this.slackRtm) {
             log.info("Closing RTM connections");
             await this.slackRtm.disconnectAll();

@@ -49,14 +49,14 @@ ever stuck, you can post a question in the
 ## Setup
 
 1. Create a new Matrix room to act as the administration control room. Note its
-   internal room ID (EX: !abcdefg12345hijk:coolserver.com).
+   internal room ID (Example: !abcdefg12345hijk:coolserver.com).
 
 2. Decide on a spare local TCP port number to use. It will listen for messages
    from Matrix and needs to be visible to the homeserver. Take care to configure
-   firewalls appropriately. This ports will be notated as `$MATRIX_PORT` in
+   firewalls appropriately. This port will be notated as `$MATRIX_PORT` in
    the remaining instructions.
 
-3. Create a `config.yaml` file for global configuration. There is a sample
+3. Create a `config/config.yaml` file for global configuration. There is a sample
    one to begin with in `config/config.sample.yaml`. You should copy and
    edit as appropriate. The required and optional values are flagged in the config.
 
@@ -68,7 +68,7 @@ ever stuck, you can post a question in the
    port it will send messages through (if this bridge runs on the same
    machine you can use `localhost` as the `$HOST` name):
    
-    `$ npm start -- -r -c config.yaml -u "http://$HOST:$MATRIX_PORT"`
+    `$ npm start -- -r -c config/config.yaml -u "http://$HOST:$MATRIX_PORT"`
    or with docker:
    
 ```sh
@@ -78,7 +78,7 @@ $ docker run -v /path/to/config/:/config/ matrixdotorg/matrix-appservice-slack \
 
 6. Start the actual application service:
 
-    `$ npm start -- -c config.yaml -p $MATRIX_PORT`
+    `$ npm start -- -c config/config.yaml -p $MATRIX_PORT`
    or with docker:
    
     `$ docker run -v /path/to/config/:/config/ matrixdotorg/matrix-appservice-slack`
@@ -120,6 +120,9 @@ The bridge itself should now be running. Congrats!
 
 To actually use it, you will need to configure some linked channels, see
 [linking channels](link_channels.md).
+
+Once a Slack Workspace is connected, you can offer automatic hints on how
+to bridge existing and new channels by enabling [Workspace Sync](team_sync.md).
 
 ## Proxying
 

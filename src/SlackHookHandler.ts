@@ -23,7 +23,7 @@ import { Logging } from "matrix-appservice-bridge";
 import { SlackEventHandler } from "./SlackEventHandler";
 import { BaseSlackHandler, HTTP_CODES, ISlackMessageEvent } from "./BaseSlackHandler";
 import { BridgedRoom } from "./BridgedRoom";
-import { Main } from "./Main";
+import { Main, METRIC_RECEIVED_MESSAGE } from "./Main";
 import { WebClient } from "@slack/web-api";
 import { ConversationsHistoryResponse } from "./SlackResponses";
 import { promisify } from "util";
@@ -90,6 +90,7 @@ export class SlackHookHandler extends BaseSlackHandler {
         const HTTP_SERVER_ERROR = 500;
         let body = "";
         req.on("data", (chunk) => body += chunk);
+        req.on("error", (err) => log.error(`Error handling request: ${req.url}: ${err}`));
         req.on("end", () => {
             log.debug(`${req.method} ${req.url} bodyLen=${body.length}`);
 
@@ -107,6 +108,10 @@ export class SlackHookHandler extends BaseSlackHandler {
                 }
             } catch (e) {
                 log.error("SlackHookHandler failed:", e);
+                // Do not send error if HTTP connection is closed
+                if (res.finished) {
+                    return;
+                }
                 res.writeHead(HTTP_SERVER_ERROR, {"Content-Type": "text/plain"});
                 if (req.method !== "HEAD") {
                     res.write("Internal Server Error");
@@ -137,7 +142,6 @@ export class SlackHookHandler extends BaseSlackHandler {
         const isUsingRtm = this.main.teamIsUsingRtm(eventPayload.team_id.toUpperCase());
         this.eventHandler.handle(
             // The event can take many forms.
-            // tslint:disable-next-line: no-any
             eventPayload.event as any,
             eventPayload.team_id,
             eventsResponse,
@@ -208,7 +212,7 @@ export class SlackHookHandler extends BaseSlackHandler {
             log.warn("Ignoring message from unrecognised inbound ID: %s (%s.#%s)",
                 inboundId, params.team_domain, params.channel_name,
             );
-            this.main.incCounter("received_messages", {side: "remote"});
+            this.main.incCounter(METRIC_RECEIVED_MESSAGE, {side: "remote"});
 
             response.writeHead(HTTP_CODES.OK, {"Content-Type": "text/plain"});
             response.end();
@@ -263,7 +267,7 @@ export class SlackHookHandler extends BaseSlackHandler {
         }
 
         // Only count received messages that aren't self-reflections
-        this.main.incCounter("received_messages", {side: "remote"});
+        this.main.incCounter(METRIC_RECEIVED_MESSAGE, {side: "remote"});
 
         if (!room.SlackClient) {
             // If we can't look up more details about the message
@@ -385,7 +389,6 @@ export class SlackHookHandler extends BaseSlackHandler {
      *     formatted as a float.
      */
     private async lookupMessage(channelID: string, timestamp: string, client: WebClient): Promise<{
-        // tslint:disable-next-line: no-any
         message: ISlackMessageEvent, content: Buffer|undefined}> {
         // Look up all messages at the exact timestamp we received.
         // This has microsecond granularity, so should return the message we want.
