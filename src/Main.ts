@@ -49,6 +49,7 @@ const log = Logging.get("Main");
 
 const RECENT_EVENTID_SIZE = 20;
 const STARTUP_TEAM_INIT_CONCURRENCY = 10;
+const STARTUP_RETRY_TIME_MS = 5000;
 export const METRIC_ACTIVE_USERS = "active_users";
 export const METRIC_ACTIVE_ROOMS = "active_rooms";
 export const METRIC_PUPPETS = "remote_puppets";
@@ -169,6 +170,12 @@ export class Main {
                     });
                 },
                 onUserQuery: () => ({}), // auto-provision users with no additional data
+            },
+            roomUpgradeOpts: {
+                consumeEvent: true,
+                migrateGhosts: true,
+                onRoomMigrated: this.onRoomUpgrade.bind(this),
+                migrateStoreEntries: false,
             },
             domain: config.homeserver.server_name,
             homeserverUrl: config.homeserver.url,
@@ -791,7 +798,9 @@ export class Main {
         this.clientfactory = new SlackClientFactory(this.datastore, this.config, (method: string) => {
             this.incRemoteCallCounter(method);
         }, (teamId: string, delta: number) => {
-            this.metricPuppets.inc({ team_id: teamId }, delta);
+            if (this.metricPuppets) {
+                this.metricPuppets.inc({ team_id: teamId }, delta);
+            }
         });
         let puppetsWaiting: Promise<unknown> = Promise.resolve();
         if (this.slackRtm) {
@@ -810,7 +819,20 @@ export class Main {
         }
         const port = this.config.homeserver.appservice_port || cliPort;
         this.bridge.run(port, this.config, this.appservice);
-        const roomListPromise = this.bridge.getBot().getJoinedRooms() as Promise<string[]>;
+        let joinedRooms: string[]|null = null;
+        while(joinedRooms === null) {
+            try {
+                joinedRooms = await this.bridge.getBot().getJoinedRooms() as string[];
+            } catch (ex) {
+                if (ex.errcode === 'M_UNKNOWN_TOKEN') {
+                    log.error("The homeserver doesn't recognise this bridge, have you configured the homeserver with the appservice registration file?");
+                } else {
+                    log.error("Failed to fetch room list:", ex);
+                }
+                log.error(`Waiting ${STARTUP_RETRY_TIME_MS}ms before retrying`);
+                await new Promise(((resolve) => setTimeout(resolve, STARTUP_RETRY_TIME_MS)));
+            }
+        }
 
         this.bridge.addAppServicePath({
             handler: this.onHealth.bind(this.bridge),
@@ -868,13 +890,12 @@ export class Main {
 
         const entries = await this.datastore.getAllRooms();
         log.info(`Found ${entries.length} room entries in store`);
-        const joinedRooms = await roomListPromise;
         i = 0;
         await Promise.all(entries.map(async (entry) => {
             i++;
             log.info(`[${i}/${entries.length}] Loading room entry ${entry.matrix_id}`);
             try {
-                await this.startupLoadRoomEntry(entry, joinedRooms, teamClients);
+                await this.startupLoadRoomEntry(entry, joinedRooms as string[], teamClients);
             } catch (ex) {
                 log.error(`Failed to load entry ${entry.matrix_id}, exception thrown`, ex);
             }
@@ -957,7 +978,12 @@ export class Main {
         let teamId: string = opts.team_id!;
 
         const matrixRoomId = opts.matrix_room_id;
+        const existingChannel = opts.slack_channel_id ? this.rooms.getBySlackChannelId(opts.slack_channel_id) : null;
         const existingRoom = this.rooms.getByMatrixRoomId(matrixRoomId);
+
+        if (existingChannel) {
+            throw Error("Channel is already bridged! Unbridge the channel first.");
+        }
 
         if (!opts.team_id && !opts.slack_bot_token) {
             if (!opts.slack_webhook_uri) {
@@ -1121,6 +1147,15 @@ export class Main {
         return accounts.find((acct) => acct.team_id === teamId);
     }
 
+    public async willExceedTeamLimit(teamId: string) {
+        // First, check if we are limited
+        if (!this.config.provisioning?.limits?.team_count) {
+            return false;
+        }
+        const idSet = new Set((await this.datastore.getAllTeams()).map((t) => t.id));
+        return idSet.add(teamId).size > this.config.provisioning?.limits?.team_count;
+    }
+
     public async killBridge() {
         log.info("Killing bridge");
         if (this.metricsCollectorInterval) {
@@ -1134,6 +1169,23 @@ export class Main {
         await this.appservice.close();
         log.info("Bridge killed");
     }
+
+    private async onRoomUpgrade(oldRoomId: string, newRoomId: string) {
+        log.info(`Room has been upgraded from ${oldRoomId} to ${newRoomId}`);
+        const bridgedroom = this.rooms.getByMatrixRoomId(oldRoomId);
+        const adminRoomUser = await this.datastore.getUserForAdminRoom(oldRoomId);
+        if (bridgedroom) {
+            log.info("Migrating channel");
+            this.rooms.removeRoom(bridgedroom);
+            bridgedroom.migrateToNewRoomId(newRoomId);
+            this.rooms.upsertRoom(bridgedroom);
+            await this.datastore.upsertRoom(bridgedroom);
+        } else if (adminRoomUser) {
+            log.info("Migrating admin room");
+            await this.datastore.setUserAdminRoom(adminRoomUser, newRoomId);
+        } // Otherwise, not a known room.
+    }
+
 
     private onHealth(_, res: Response) {
         res.status(201).send("");

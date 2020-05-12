@@ -82,6 +82,11 @@ export interface IConfig {
 
     provisioning?: {
         enable: boolean;
-        auth_callbck: string;
+        require_public_room?: boolean;
+        allow_private_channels?: boolean;
+        limits?: {
+            team_count?: number;
+            room_count?: number;
+        }
     };
 }
