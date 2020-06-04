@@ -10,13 +10,18 @@ to the bridge's database.
 
 The Real Time Messaging (RTM) API is the newer and recommended way to use the bridge.
 
-1. Add a custom app to your Slack team/workspace by visiting https://api.slack.com/apps
+1. Add a custom app to your Slack team/workspace by visiting
+   [https://api.slack.com/apps?new\_classic\_app=1](https://api.slack.com/apps?new_classic_app=1)
    and clicking on `Create New App`.
+
+   ![Screenshot](link-create-legacy-app.png)
 
 1. Name the app & select the team/workspace this app will belong to.
 
-1. Click on `Bots` and `Add Legacy Bot User`. We will use this account to bridge the
+1. Click on `App Home` and `Add Legacy Bot User`. We will use this account to bridge the
    the rooms.
+
+   ![Screenshot](link-add-legacy-bot-user.png)
 
 1. Click on `Install App` in the sidebar and `Install App to Workspace`.
 
